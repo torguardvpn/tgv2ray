@@ -8,6 +8,8 @@
 
 A lightweight LuCI-based OpenWRT application for managing V2Ray/VLESS/Trojan/Shadowsocks connections via TorGuard's subscription service, powered by Sing-box.
 
+![TorGuard V2Ray OpenWRT Screenshot](https://github.com/torguardvpn/tgv2ray/blob/main/tgv2ray_screenshot.png?raw=true)
+
 ## ✨ Features
 
 - 🌐 **Server Subscription Management**: Automatically fetch and manage server lists from TorGuard API
