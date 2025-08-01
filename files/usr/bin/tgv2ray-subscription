@@ -1,0 +1,363 @@
+#!/bin/bash
+# TorGuard V2Ray subscription handler
+# Converts V2Ray subscription URLs to JSON for Sing-box
+
+CONFIG_DIR="/etc/tgv2ray"
+SERVERS_FILE="$CONFIG_DIR/servers.json"
+CACHE_FILE="$CONFIG_DIR/subscription.cache"
+FALLBACK_FILE="$CONFIG_DIR/v2ray_default.conf"
+
+# Ensure config directory exists
+mkdir -p "$CONFIG_DIR"
+
+# Function to decode base64url
+decode_base64url() {
+    local input="$1"
+    # Add padding if needed
+    local padding=$((4 - ${#input} % 4))
+    [ $padding -ne 4 ] && input="${input}$(printf '=%.0s' $(seq 1 $padding))"
+    # Replace URL-safe characters
+    input="${input//-/+}"
+    input="${input//_/\/}"
+    echo "$input" | base64 -d 2>/dev/null
+}
+
+# Function to parse VLESS URL
+parse_vless() {
+    local url="$1"
+    url="${url#vless://}"
+    
+    # Extract components using sed/awk
+    local uuid=$(echo "$url" | sed 's/@.*//')
+    local rest=$(echo "$url" | sed 's/^[^@]*@//')
+    local server=$(echo "$rest" | sed 's/:.*//')
+    local port=$(echo "$rest" | sed 's/^[^:]*://' | sed 's/?.*//')
+    local params=$(echo "$rest" | grep -o '?.*' | sed 's/^?//' | sed 's/#.*//')
+    local name=$(echo "$rest" | grep -o '#.*' | sed 's/^#//' | sed 's/%20/ /g')
+    
+    # Default values
+    local security="tls"
+    local type="tcp"
+    local sni="$server"
+    local host=""
+    local path=""
+    
+    # Parse parameters
+    if [ -n "$params" ]; then
+        IFS='&' read -ra PARAMS <<< "$params"
+        for param in "${PARAMS[@]}"; do
+            key="${param%%=*}"
+            value="${param#*=}"
+            case "$key" in
+                security) security="$value" ;;
+                type) type="$value" ;;
+                sni) sni="$value" ;;
+                host) host="$value" ;;
+                path) path=$(echo "$value" | sed 's/%2F/\//g') ;;
+            esac
+        done
+    fi
+    
+    # Output JSON
+    cat <<EOF
+{
+    "type": "vless",
+    "tag": "${name:-VLESS Server}",
+    "server": "$server",
+    "server_port": $port,
+    "uuid": "$uuid",
+    "security": "$security",
+    "transport": "$type",
+    "sni": "$sni",
+    "host": "$host",
+    "path": "$path"
+}
+EOF
+}
+
+# Function to parse VMess URL
+parse_vmess() {
+    local url="$1"
+    url="${url#vmess://}"
+    
+    # VMess URLs are base64 encoded JSON
+    local decoded=$(echo "$url" | base64 -d 2>/dev/null)
+    if [ $? -ne 0 ]; then
+        return 1
+    fi
+    
+    # Extract fields using sed (poor man's JSON parser)
+    local server=$(echo "$decoded" | grep -o '"add":"[^"]*"' | sed 's/"add":"//' | sed 's/"$//')
+    local port=$(echo "$decoded" | grep -o '"port":[^,}]*' | sed 's/"port"://' | sed 's/[" ]//g')
+    local uuid=$(echo "$decoded" | grep -o '"id":"[^"]*"' | sed 's/"id":"//' | sed 's/"$//')
+    local name=$(echo "$decoded" | grep -o '"ps":"[^"]*"' | sed 's/"ps":"//' | sed 's/"$//')
+    local type=$(echo "$decoded" | grep -o '"net":"[^"]*"' | sed 's/"net":"//' | sed 's/"$//')
+    local host=$(echo "$decoded" | grep -o '"host":"[^"]*"' | sed 's/"host":"//' | sed 's/"$//')
+    local path=$(echo "$decoded" | grep -o '"path":"[^"]*"' | sed 's/"path":"//' | sed 's/"$//')
+    local tls=$(echo "$decoded" | grep -o '"tls":"[^"]*"' | sed 's/"tls":"//' | sed 's/"$//')
+    
+    # Default values
+    [ -z "$type" ] && type="tcp"
+    [ -z "$tls" ] && tls="none"
+    
+    # Output JSON
+    cat <<EOF
+{
+    "type": "vmess",
+    "tag": "${name:-VMess Server}",
+    "server": "$server",
+    "server_port": $port,
+    "uuid": "$uuid",
+    "security": "$tls",
+    "transport": "$type",
+    "host": "$host",
+    "path": "$path"
+}
+EOF
+}
+
+# Function to parse Trojan URL
+parse_trojan() {
+    local url="$1"
+    url="${url#trojan://}"
+    
+    # Extract components
+    local password=$(echo "$url" | sed 's/@.*//')
+    local rest=$(echo "$url" | sed 's/^[^@]*@//')
+    local server=$(echo "$rest" | sed 's/:.*//')
+    local port=$(echo "$rest" | sed 's/^[^:]*://' | sed 's/?.*//')
+    local params=$(echo "$rest" | grep -o '?.*' | sed 's/^?//' | sed 's/#.*//')
+    local name=$(echo "$rest" | grep -o '#.*' | sed 's/^#//' | sed 's/%20/ /g')
+    
+    # Default values
+    local sni="$server"
+    
+    # Parse parameters
+    if [ -n "$params" ]; then
+        IFS='&' read -ra PARAMS <<< "$params"
+        for param in "${PARAMS[@]}"; do
+            key="${param%%=*}"
+            value="${param#*=}"
+            case "$key" in
+                sni) sni="$value" ;;
+            esac
+        done
+    fi
+    
+    # Output JSON
+    cat <<EOF
+{
+    "type": "trojan",
+    "tag": "${name:-Trojan Server}",
+    "server": "$server",
+    "server_port": $port,
+    "password": "$password",
+    "sni": "$sni"
+}
+EOF
+}
+
+# Function to parse Shadowsocks URL
+parse_ss() {
+    local url="$1"
+    url="${url#ss://}"
+    
+    # Extract name if present
+    local name=""
+    if [[ "$url" == *"#"* ]]; then
+        name=$(echo "$url" | grep -o '#.*' | sed 's/^#//' | sed 's/%20/ /g')
+        url="${url%%#*}"
+    fi
+    
+    # Decode the base64 part
+    local encoded="${url%%@*}"
+    local decoded=$(decode_base64url "$encoded")
+    
+    # Extract method and password
+    local method=$(echo "$decoded" | cut -d: -f1)
+    local password=$(echo "$decoded" | cut -d: -f2-)
+    
+    # Extract server and port
+    local rest="${url#*@}"
+    local server=$(echo "$rest" | sed 's/:.*//')
+    local port=$(echo "$rest" | sed 's/^[^:]*://')
+    
+    # Output JSON
+    cat <<EOF
+{
+    "type": "shadowsocks",
+    "tag": "${name:-Shadowsocks Server}",
+    "server": "$server",
+    "server_port": $port,
+    "method": "$method",
+    "password": "$password"
+}
+EOF
+}
+
+# Function to fetch and parse subscription
+fetch_subscription() {
+    local uuid="$1"
+    # Use the static API token, not the user's UUID
+    local api_url="https://torguard.net/tgv2ray.php?token=HukM6qmJfbCnprcjBChN25VjE"
+    
+    # For testing: simulate API failure
+    # local api_url="https://invalid-domain-that-does-not-exist.com/api"
+    
+    echo "Fetching subscription from TorGuard API..."
+    
+    # Download subscription
+    local response=$(curl -s -m 30 "$api_url" -H "User-Agent: TorGuard-V2Ray-Client/1.0" -H "Accept: text/plain")
+    
+    local using_fallback=0
+    if [ -z "$response" ] || [ "$response" = "[]" ] || [ "$response" = "{}" ]; then
+        echo "Error: Empty response from API, using fallback servers..."
+        
+        # Load fallback config
+        if [ -f "$FALLBACK_FILE" ]; then
+            # Replace FAKE-UUID-REPLACE-ME with actual UUID
+            response=$(sed "s/FAKE-UUID-REPLACE-ME/$uuid/g" "$FALLBACK_FILE")
+            using_fallback=1
+        else
+            echo "Error: No fallback config found"
+            return 1
+        fi
+    fi
+    
+    # Try to decode as base64 (skip if using fallback)
+    local decoded="$response"
+    if [ "$using_fallback" -eq 0 ]; then
+        # API response is base64 encoded
+        decoded=$(echo "$response" | base64 -d 2>/dev/null)
+        if [ -z "$decoded" ]; then
+            echo "Error: Failed to decode API response"
+            return 1
+        fi
+        # Replace the fake UUID with the user's actual UUID
+        decoded=$(echo "$decoded" | sed "s/FAKEFAKE-FAKE-FAKE-FAKE-FAKEFAKEFAKE/$uuid/g")
+    fi
+    
+    # Save raw subscription for debugging
+    echo "$decoded" > "$CACHE_FILE"
+    
+    # Parse each line as a proxy URL
+    local servers="[]"
+    local count=0
+    
+    while IFS= read -r line; do
+        line=$(echo "$line" | tr -d '\r\n' | xargs)
+        [ -z "$line" ] && continue
+        
+        local parsed=""
+        if [[ "$line" == vless://* ]]; then
+            parsed=$(parse_vless "$line")
+        elif [[ "$line" == vmess://* ]]; then
+            parsed=$(parse_vmess "$line")
+        elif [[ "$line" == trojan://* ]]; then
+            parsed=$(parse_trojan "$line")
+        elif [[ "$line" == ss://* ]]; then
+            parsed=$(parse_ss "$line")
+        fi
+        
+        if [ -n "$parsed" ]; then
+            # Add to array (using jq if available, otherwise manual concatenation)
+            if command -v jq >/dev/null 2>&1; then
+                servers=$(echo "$servers" | jq ". += [$parsed]")
+            else
+                # Manual JSON array building
+                if [ "$count" -eq 0 ]; then
+                    servers="[$parsed"
+                else
+                    servers="$servers,$parsed"
+                fi
+            fi
+            ((count++))
+        fi
+    done <<< "$decoded"
+    
+    # Close JSON array if built manually
+    if ! command -v jq >/dev/null 2>&1 && [ "$count" -gt 0 ]; then
+        servers="$servers]"
+    fi
+    
+    # Save servers list
+    echo "$servers" > "$SERVERS_FILE"
+    
+    echo "Successfully fetched $count servers"
+    return 0
+}
+
+# Function to update server list in UCI
+update_uci_servers() {
+    if [ ! -f "$SERVERS_FILE" ]; then
+        echo "No servers file found"
+        return 1
+    fi
+    
+    # Clear existing server list
+    uci -q delete tgv2ray.@server[0]
+    
+    # Add servers to UCI (simplified - just store server names)
+    if command -v jq >/dev/null 2>&1; then
+        local servers=$(jq -r '.[] | .tag' "$SERVERS_FILE" 2>/dev/null)
+        for server in $servers; do
+            uci set tgv2ray.settings.server="$server"
+        done
+    fi
+    
+    uci commit tgv2ray
+}
+
+# Main command handler
+case "$1" in
+    update)
+        # Get UUID from UCI
+        UUID=$(uci -q get tgv2ray.settings.uuid)
+        if [ -z "$UUID" ]; then
+            echo "Error: UUID not configured"
+            exit 1
+        fi
+        
+        fetch_subscription "$UUID"
+        update_uci_servers
+        ;;
+    
+    parse)
+        # Parse a single URL (for custom server import)
+        if [ -z "$2" ]; then
+            echo "Usage: $0 parse <url>"
+            exit 1
+        fi
+        
+        if [[ "$2" == vless://* ]]; then
+            parse_vless "$2"
+        elif [[ "$2" == vmess://* ]]; then
+            parse_vmess "$2"
+        elif [[ "$2" == trojan://* ]]; then
+            parse_trojan "$2"
+        elif [[ "$2" == ss://* ]]; then
+            parse_ss "$2"
+        else
+            echo "Error: Unsupported URL format"
+            exit 1
+        fi
+        ;;
+    
+    list)
+        # List saved servers
+        if [ -f "$SERVERS_FILE" ]; then
+            if command -v jq >/dev/null 2>&1; then
+                jq -r '.[] | "\(.tag) [\(.type)] - \(.server):\(.server_port)"' "$SERVERS_FILE"
+            else
+                cat "$SERVERS_FILE"
+            fi
+        else
+            echo "No servers found. Run 'update' first."
+        fi
+        ;;
+    
+    *)
+        echo "Usage: $0 {update|parse <url>|list}"
+        exit 1
+        ;;
+esac 

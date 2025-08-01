@@ -1,0 +1,506 @@
+#!/bin/sh
+# Generate Sing-box config from selected server
+
+CONFIG_DIR="/etc/tgv2ray"
+TEMPLATE_FILE="$CONFIG_DIR/config.json.template"
+OUTPUT_FILE="$CONFIG_DIR/config.json"
+SERVERS_FILE="$CONFIG_DIR/servers.json"
+
+# Get settings from UCI
+ENABLED=$(uci -q get tgv2ray.settings.enabled || echo "0")
+MODE=$(uci -q get tgv2ray.settings.mode || echo "vpn")
+SERVER_NAME=$(uci -q get tgv2ray.settings.server || echo "")
+LOCAL_IP=$(uci -q get tgv2ray.settings.local_ip || echo "172.20.0.1")
+
+if [ "$ENABLED" != "1" ]; then
+    echo "TorGuard V2Ray is disabled"
+    exit 0
+fi
+
+if [ ! -f "$SERVERS_FILE" ]; then
+    echo "Error: No servers file found. Run subscription update first."
+    exit 1
+fi
+
+if [ -z "$SERVER_NAME" ]; then
+    echo "Error: No server selected"
+    exit 1
+fi
+
+# Find server in servers.json
+if command -v jq >/dev/null 2>&1; then
+    SERVER_DATA=$(jq -r ".[] | select(.tag == \"$SERVER_NAME\")" "$SERVERS_FILE" 2>/dev/null)
+else
+    # Fallback: grep for server name and extract the JSON object
+    SERVER_DATA=$(grep -A20 "\"tag\": \"$SERVER_NAME\"" "$SERVERS_FILE" | sed -n '/^{/,/^}/p')
+fi
+
+if [ -z "$SERVER_DATA" ]; then
+    echo "Error: Server '$SERVER_NAME' not found"
+    exit 1
+fi
+
+# Extract server details
+if command -v jq >/dev/null 2>&1; then
+    TYPE=$(echo "$SERVER_DATA" | jq -r '.type')
+    SERVER=$(echo "$SERVER_DATA" | jq -r '.server')
+    PORT=$(echo "$SERVER_DATA" | jq -r '.server_port')
+    UUID=$(echo "$SERVER_DATA" | jq -r '.uuid // empty')
+    PASSWORD=$(echo "$SERVER_DATA" | jq -r '.password // empty')
+    METHOD=$(echo "$SERVER_DATA" | jq -r '.method // empty')
+    SECURITY=$(echo "$SERVER_DATA" | jq -r '.security // "tls"')
+    SNI=$(echo "$SERVER_DATA" | jq -r '.sni // .server')
+    TRANSPORT=$(echo "$SERVER_DATA" | jq -r '.transport // "tcp"')
+    HOST=$(echo "$SERVER_DATA" | jq -r '.host // empty')
+    PATH=$(echo "$SERVER_DATA" | jq -r '.path // empty')
+    REALITY=$(echo "$SERVER_DATA" | jq -r '.reality // empty')
+    PUBLIC_KEY=$(echo "$SERVER_DATA" | jq -r '.public_key // empty')
+    SHORT_ID=$(echo "$SERVER_DATA" | jq -r '.short_id // empty')
+else
+    # Manual extraction using sed/grep
+    TYPE=$(echo "$SERVER_DATA" | grep -o '"type": "[^"]*"' | sed 's/"type": "//' | sed 's/"$//')
+    SERVER=$(echo "$SERVER_DATA" | grep -o '"server": "[^"]*"' | sed 's/"server": "//' | sed 's/"$//')
+    PORT=$(echo "$SERVER_DATA" | grep -o '"server_port": [0-9]*' | sed 's/"server_port": //')
+    UUID=$(echo "$SERVER_DATA" | grep -o '"uuid": "[^"]*"' | sed 's/"uuid": "//' | sed 's/"$//')
+    PASSWORD=$(echo "$SERVER_DATA" | grep -o '"password": "[^"]*"' | sed 's/"password": "//' | sed 's/"$//')
+    METHOD=$(echo "$SERVER_DATA" | grep -o '"method": "[^"]*"' | sed 's/"method": "//' | sed 's/"$//')
+    SECURITY=$(echo "$SERVER_DATA" | grep -o '"security": "[^"]*"' | sed 's/"security": "//' | sed 's/"$//')
+    SNI=$(echo "$SERVER_DATA" | grep -o '"sni": "[^"]*"' | sed 's/"sni": "//' | sed 's/"$//')
+    TRANSPORT=$(echo "$SERVER_DATA" | grep -o '"transport": "[^"]*"' | sed 's/"transport": "//' | sed 's/"$//')
+    HOST=$(echo "$SERVER_DATA" | grep -o '"host": "[^"]*"' | sed 's/"host": "//' | sed 's/"$//')
+    PATH=$(echo "$SERVER_DATA" | grep -o '"path": "[^"]*"' | sed 's/"path": "//' | sed 's/"$//')
+fi
+
+# Default values
+[ -z "$SECURITY" ] && SECURITY="tls"
+[ -z "$SNI" ] && SNI="$SERVER"
+[ -z "$TRANSPORT" ] && TRANSPORT="tcp"
+
+# Build auth config based on proxy type
+case "$TYPE" in
+    vless)
+        AUTH_CONFIG="\"uuid\": \"$UUID\",
+            \"flow\": \"\""
+        if [ "$SECURITY" = "tls" ]; then
+            AUTH_CONFIG="$AUTH_CONFIG,
+            \"tls\": {
+                \"enabled\": true,
+                \"server_name\": \"$SNI\",
+                \"insecure\": false
+            },"
+        fi
+        ;;
+    vmess)
+        AUTH_CONFIG="\"uuid\": \"$UUID\",
+            \"security\": \"auto\",
+            \"alter_id\": 0"
+        if [ "$SECURITY" = "tls" ]; then
+            AUTH_CONFIG="$AUTH_CONFIG,
+            \"tls\": {
+                \"enabled\": true,
+                \"server_name\": \"$SNI\",
+                \"insecure\": false
+            },"
+        fi
+        ;;
+    trojan)
+        AUTH_CONFIG="\"password\": \"$PASSWORD\",
+            \"tls\": {
+                \"enabled\": true,
+                \"server_name\": \"$SNI\",
+                \"insecure\": false
+            },"
+        ;;
+    shadowsocks)
+        AUTH_CONFIG="\"method\": \"$METHOD\",
+            \"password\": \"$PASSWORD\","
+        ;;
+esac
+
+# Add transport config if not TCP
+if [ "$TRANSPORT" != "tcp" ] && [ "$TRANSPORT" != "" ]; then
+    case "$TRANSPORT" in
+        ws)
+            AUTH_CONFIG="$AUTH_CONFIG
+            \"transport\": {
+                \"type\": \"ws\",
+                \"path\": \"${PATH:-/}\",
+                \"headers\": {
+                    \"Host\": \"${HOST:-$SERVER}\"
+                }
+            },"
+            ;;
+        grpc)
+            AUTH_CONFIG="$AUTH_CONFIG
+            \"transport\": {
+                \"type\": \"grpc\",
+                \"service_name\": \"${PATH}\"
+            },"
+            ;;
+    esac
+fi
+
+# Remove trailing comma
+AUTH_CONFIG=$(echo "$AUTH_CONFIG" | /bin/sed 's/,$//')
+
+# Generate config based on mode
+if [ "$MODE" = "proxy" ]; then
+    # Proxy mode - no TUN, add SOCKS/HTTP inbounds
+    /bin/cat > "$OUTPUT_FILE" <<EOF
+{
+    "log": {
+        "level": "info",
+        "timestamp": true
+    },
+    "dns": {
+        "servers": [
+            {
+                "tag": "proxy-dns",
+                "address": "https://1.1.1.1/dns-query",
+                "detour": "direct"
+            },
+            {
+                "tag": "local-dns",
+                "address": "223.5.5.5",
+                "detour": "direct"
+            }
+        ]
+    },
+    "inbounds": [
+        {
+            "type": "socks",
+            "tag": "socks-in",
+            "listen": "0.0.0.0",
+            "listen_port": 1080,
+            "users": []
+        },
+        {
+            "type": "http",
+            "tag": "http-in",
+            "listen": "0.0.0.0",
+            "listen_port": 8080,
+            "users": []
+        }
+    ],
+    "outbounds": [
+        {
+            "type": "$TYPE",
+            "tag": "proxy",
+            "server": "$SERVER",
+            "server_port": $PORT,
+EOF
+    
+    # Add type-specific config
+    case "$TYPE" in
+        vless)
+            /bin/cat >> "$OUTPUT_FILE" <<EOF
+            "uuid": "$UUID",
+
+EOF
+            if [ "$SECURITY" = "tls" ]; then
+                /bin/cat >> "$OUTPUT_FILE" <<EOF
+            "tls": {
+                "enabled": true,
+                "server_name": "$SNI",
+                "insecure": false
+            }
+EOF
+            fi
+            if [ "$TRANSPORT" = "ws" ]; then
+                if [ "$SECURITY" = "tls" ]; then
+                    /bin/cat >> "$OUTPUT_FILE" <<EOF
+            ,"transport": {
+                "type": "ws",
+                "path": "${PATH:-/}",
+                "headers": {
+                    "Host": "${HOST:-$SERVER}"
+                }
+            }
+EOF
+                else
+                    /bin/cat >> "$OUTPUT_FILE" <<EOF
+            "transport": {
+                "type": "ws",
+                "path": "${PATH:-/}",
+                "headers": {
+                    "Host": "${HOST:-$SERVER}"
+                }
+            }
+EOF
+                fi
+            else
+                if [ "$SECURITY" != "tls" ]; then
+                    # Remove trailing comma for last field
+                    /bin/sed -i '$ s/,$//' "$OUTPUT_FILE"
+                fi
+            fi
+            ;;
+        vmess)
+            /bin/cat >> "$OUTPUT_FILE" <<EOF
+            "uuid": "$UUID",
+            "security": "auto",
+            "alter_id": 0,
+EOF
+            if [ "$SECURITY" = "tls" ]; then
+                /bin/cat >> "$OUTPUT_FILE" <<EOF
+            "tls": {
+                "enabled": true,
+                "server_name": "$SNI",
+                "insecure": false
+            }
+EOF
+            fi
+            if [ "$TRANSPORT" = "ws" ]; then
+                if [ "$SECURITY" = "tls" ] || [ "$TYPE" = "vmess" ]; then
+                    /bin/cat >> "$OUTPUT_FILE" <<EOF
+            ,"transport": {
+                "type": "ws",
+                "path": "${PATH:-/}",
+                "headers": {
+                    "Host": "${HOST:-$SERVER}"
+                }
+            }
+EOF
+                else
+                    /bin/cat >> "$OUTPUT_FILE" <<EOF
+            "transport": {
+                "type": "ws",
+                "path": "${PATH:-/}",
+                "headers": {
+                    "Host": "${HOST:-$SERVER}"
+                }
+            }
+EOF
+                fi
+            else
+                if [ "$SECURITY" != "tls" ]; then
+                    /bin/sed -i '$ s/,$//' "$OUTPUT_FILE"
+                fi
+            fi
+            ;;
+        trojan)
+            /bin/cat >> "$OUTPUT_FILE" <<EOF
+            "password": "$PASSWORD",
+            "tls": {
+                "enabled": true,
+                "server_name": "$SNI",
+                "insecure": false
+            }
+EOF
+            ;;
+        shadowsocks)
+            /bin/cat >> "$OUTPUT_FILE" <<EOF
+            "method": "$METHOD",
+            "password": "$PASSWORD"
+EOF
+            ;;
+    esac
+    
+    # Complete the config
+    /bin/cat >> "$OUTPUT_FILE" <<EOF
+        },
+        {
+            "type": "direct",
+            "tag": "direct"
+        },
+        {
+            "type": "dns",
+            "tag": "dns-out"
+        }
+    ],
+    "route": {
+        "rules": [
+            {
+                "protocol": "dns",
+                "outbound": "dns-out"
+            },
+            {
+                "ip_is_private": true,
+                "outbound": "direct"
+            }
+        ]
+    }
+}
+EOF
+else
+    # VPN mode - use TUN
+    /bin/cat > "$OUTPUT_FILE" <<EOF
+{
+    "log": {
+        "level": "info",
+        "timestamp": true
+    },
+    "dns": {
+        "servers": [
+            {
+                "tag": "proxy-dns",
+                "address": "https://1.1.1.1/dns-query",
+                "detour": "direct"
+            },
+            {
+                "tag": "direct-dns",
+                "address": "8.8.8.8",
+                "detour": "direct"
+            },
+            {
+                "tag": "local-dns",
+                "address": "223.5.5.5",
+                "detour": "direct"
+            }
+        ],
+        "rules": [
+            {
+                "outbound": "direct",
+                "server": "direct-dns"
+            },
+            {
+                "clash_mode": "direct",
+                "server": "direct-dns"
+            }
+        ],
+        "strategy": "prefer_ipv4",
+        "independent_cache": true
+    },
+    "inbounds": [
+        {
+            "type": "tun",
+            "tag": "tun-in",
+            "interface_name": "tun0",
+            "address": ["172.19.0.1/30"],
+            "mtu": 1420,
+            "auto_route": true,
+            "strict_route": false,
+            "stack": "system",
+            "sniff": true,
+            "sniff_override_destination": true
+        }
+    ],
+    "outbounds": [
+        {
+            "type": "$TYPE",
+            "tag": "proxy",
+            "server": "$SERVER",
+            "server_port": $PORT,
+EOF
+    
+    # Add type-specific config for VPN mode
+    case "$TYPE" in
+        vless)
+            /bin/cat >> "$OUTPUT_FILE" <<EOF
+            "uuid": "$UUID",
+
+EOF
+            if [ "$TRANSPORT" = "ws" ]; then
+                /bin/cat >> "$OUTPUT_FILE" <<EOF
+            "transport": {
+                "type": "ws",
+                "path": "${PATH:-/}",
+                "headers": {
+                    "Host": "${HOST:-$SERVER}"
+                }
+            },
+EOF
+            fi
+            if [ "$SECURITY" = "tls" ]; then
+                /bin/cat >> "$OUTPUT_FILE" <<EOF
+            "tls": {
+                "enabled": true,
+                "server_name": "${SNI:-$SERVER}",
+                "insecure": false
+            }
+EOF
+            else
+                /bin/sed -i '$ s/,$//' "$OUTPUT_FILE"
+            fi
+            ;;
+        vmess)
+            /bin/cat >> "$OUTPUT_FILE" <<EOF
+            "uuid": "$UUID",
+            "security": "auto",
+            "alter_id": 0,
+EOF
+            if [ "$TRANSPORT" = "ws" ]; then
+                /bin/cat >> "$OUTPUT_FILE" <<EOF
+            "transport": {
+                "type": "ws",
+                "path": "${PATH:-/}",
+                "headers": {
+                    "Host": "${HOST:-$SERVER}"
+                }
+            },
+EOF
+            fi
+            if [ "$SECURITY" = "tls" ]; then
+                /bin/cat >> "$OUTPUT_FILE" <<EOF
+            "tls": {
+                "enabled": true,
+                "server_name": "${SNI:-$SERVER}",
+                "insecure": false
+            }
+EOF
+            else
+                /bin/sed -i '$ s/,$//' "$OUTPUT_FILE"
+            fi
+            ;;
+        trojan)
+            /bin/cat >> "$OUTPUT_FILE" <<EOF
+            "password": "$PASSWORD",
+            "tls": {
+                "enabled": true,
+                "server_name": "$SNI",
+                "insecure": false
+            }
+EOF
+            ;;
+        shadowsocks)
+            /bin/cat >> "$OUTPUT_FILE" <<EOF
+            "method": "$METHOD",
+            "password": "$PASSWORD"
+EOF
+            ;;
+    esac
+    
+    # Complete the VPN config
+    /bin/cat >> "$OUTPUT_FILE" <<EOF
+        },
+        {
+            "type": "direct",
+            "tag": "direct"
+        },
+        {
+            "type": "dns",
+            "tag": "dns-out"
+        }
+    ],
+    "route": {
+        "auto_detect_interface": true,
+        "final": "proxy",
+        "rules": [
+            {
+                "protocol": "dns",
+                "outbound": "dns-out"
+            },
+            {
+                "domain": [
+                    "$SERVER"
+                ],
+                "outbound": "direct"
+            },
+            {
+                "ip_cidr": [
+                    "192.168.0.0/16",
+                    "10.0.0.0/8",
+                    "172.16.0.0/12",
+                    "127.0.0.0/8",
+                    "224.0.0.0/4",
+                    "240.0.0.0/4"
+                ],
+                "outbound": "direct"
+            }
+        ]
+    }
+}
+EOF
+fi
+
+echo "Generated Sing-box config for $SERVER_NAME ($TYPE)" 

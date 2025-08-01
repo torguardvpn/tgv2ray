@@ -1,0 +1,17 @@
+<%+cbi/valueheader%>
+<span id="tgv2ray-status">
+    <em><%:Checking...%></em>
+</span>
+<script type="text/javascript">//<![CDATA[
+    XHR.poll(5, '<%=url("admin/vpn/tgv2ray/status")%>', null,
+        function(x, data) {
+            var status = document.getElementById('tgv2ray-status');
+            if (data && data.running) {
+                status.innerHTML = '<span style="color:green"><%:Running%></span>';
+            } else {
+                status.innerHTML = '<span style="color:red"><%:Stopped%></span>';
+            }
+        }
+    );
+//]]></script>
+<%+cbi/valuefooter%> 

@@ -1,0 +1,65 @@
+#!/bin/sh
+
+# Create default UCI configuration if it doesn't exist
+if [ ! -f /etc/config/tgv2ray ]; then
+    touch /etc/config/tgv2ray
+    
+    uci -q batch <<-EOF
+	set tgv2ray.settings=tgv2ray
+	set tgv2ray.settings.enabled='0'
+	set tgv2ray.settings.mode='proxy'
+	set tgv2ray.settings.uuid=''
+	set tgv2ray.settings.subscription_url=''
+	set tgv2ray.settings.selected_server=''
+	set tgv2ray.settings.local_port='1080'
+	set tgv2ray.settings.http_port='8080'
+	set tgv2ray.settings.allow_lan='0'
+	set tgv2ray.settings.log_level='info'
+	set tgv2ray.settings.auto_update='0'
+	set tgv2ray.settings.singbox_path='/usr/bin/sing-box'
+	set tgv2ray.settings.local_ip='172.20.0.1'
+	
+	set tgv2ray.custom=server
+	set tgv2ray.custom.name='Custom Server'
+	set tgv2ray.custom.link=''
+	set tgv2ray.custom.enabled='0'
+	
+	commit tgv2ray
+EOF
+fi
+
+# Create directories
+mkdir -p /etc/tgv2ray
+mkdir -p /var/log
+
+# Set permissions
+chmod 755 /usr/bin/tgv2ray-subscription
+chmod 755 /usr/bin/tgv2ray-config-gen
+chmod 755 /etc/init.d/tgv2ray
+
+# Create proxy firewall zone for VPN mode (pre-create)
+# This ensures the zone exists for when VPN mode is enabled
+uci -q batch <<-EOF
+	# Check if proxy zone already exists
+	get firewall.proxy >/dev/null 2>&1 || {
+		set firewall.proxy=zone
+		set firewall.proxy.name='proxy'
+		set firewall.proxy.forward='REJECT'
+		set firewall.proxy.output='ACCEPT'
+		set firewall.proxy.input='ACCEPT'
+		set firewall.proxy.mtu_fix='1'
+		set firewall.proxy.device='tun0'
+		add_list firewall.proxy.network='proxy'
+		
+		set firewall.lan_proxy=forwarding
+		set firewall.lan_proxy.name='lan-proxy'
+		set firewall.lan_proxy.src='lan'
+		set firewall.lan_proxy.dest='proxy'
+	}
+	
+	commit firewall
+EOF
+
+# Network interface will be created by init.d script when VPN mode is enabled
+
+exit 0 
