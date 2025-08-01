@@ -42,7 +42,7 @@ A lightweight LuCI-based OpenWRT application for managing V2Ray/VLESS/Trojan/Sha
 
 1. **Download the latest release IPK**:
    ```bash
-   wget https://github.com/yourusername/tgv2ray/releases/latest/download/tgv2ray_1.0.0-2_all.ipk
+   wget https://github.com/torguardvpn/tgv2ray/releases/download/v1.0.0-6/tgv2ray_1.0.0-6_all.ipk
    ```
 
 2. **Install dependencies**:
@@ -74,7 +74,7 @@ A lightweight LuCI-based OpenWRT application for managing V2Ray/VLESS/Trojan/Sha
 
 2. **Clone the repository**:
    ```bash
-   git clone https://github.com/yourusername/tgv2ray.git package/tgv2ray
+   git clone https://github.com/torguardvpn/tgv2ray.git package/tgv2ray
    ```
 
 3. **Update feeds**:
